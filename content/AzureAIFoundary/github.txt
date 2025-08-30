@@ -1,0 +1,254 @@
+import os
+import asyncio
+import subprocess
+from typing import List, Optional # Import Optional
+
+from semantic_kernel.agents import AgentGroupChat, ChatCompletionAgent
+from semantic_kernel.agents.strategies.termination.termination_strategy import TerminationStrategy
+from semantic_kernel.connectors.ai.open_ai.services.azure_chat_completion import AzureChatCompletion
+from semantic_kernel.contents.chat_message_content import ChatMessageContent
+from semantic_kernel.contents.utils.author_role import AuthorRole
+from semantic_kernel.kernel import Kernel
+
+# --- Environment Variable Loading ---
+# Load environment variables from a .env file if it exists
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("dotenv not installed, skipping. Make sure environment variables are set.")
+
+GLOBAL_LLM_SERVICE = os.getenv("GLOBAL_LLM_SERVICE", "azure")
+AZURE_OPENAI_CHAT_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+GITHUB_REPO_URL = os.getenv("GITHUB_REPO_URL")
+GITHUB_PAT = os.getenv("GITHUB_PAT")
+GIT_USER_EMAIL = os.getenv("GIT_USER_EMAIL")
+GITHUB_USERNAME = os.getenv("GITHUB_USERNAME")
+
+# --- Agent Personas ---
+
+BUSINESS_ANALYST_PERSONA = """
+You are a Business Analyst. Your role is to take requirements from the user (the 'customer') and create a detailed project plan for building the requested application.
+
+Responsibilities:
+- Understand and clarify user requirements.
+- Create comprehensive documents detailing requirements and estimated effort (costing).
+- Ensure the documentation is clear enough for the Software Engineer to use as a blueprint.
+- Ensure the documentation is detailed enough for the Product Owner to verify the final product against.
+"""
+
+SOFTWARE_ENGINEER_PERSONA = """
+You are a Software Engineer. Your goal is to create a web application using HTML and JavaScript based on the requirements provided by the Business Analyst.
+
+Responsibilities:
+- Implement all features as specified in the requirements document.
+- Write clean, functional, and well-structured code.
+- You can ask the Business Analyst for clarification if any requirement is unclear.
+- When the implementation is complete, deliver the full HTML code to the Product Owner for review.
+- **IMPORTANT**: You must wrap the final HTML code in a markdown block like this: ```html [your code here] ```.
+"""
+
+PRODUCT_OWNER_PERSONA = """
+You are the Product Owner. You are the guardian of quality and your primary role is to review the Software Engineer's code to ensure it meets all user requirements.
+
+Responsibilities:
+- Verify that the delivered application fulfills all specifications from the Business Analyst's documents.
+- **CRITICAL**: Check that the Software Engineer has shared the code using the required format: ```html [code] ```. This format is essential for the automated system to save the code and push it to GitHub.
+- If all requirements are met and the code is correctly formatted, you MUST respond with the exact phrase 'READY FOR USER APPROVAL' and nothing else.
+- If there are missing features, bugs, or formatting issues, you must send a detailed defect report back to the SoftwareEngineer or BusinessAnalyst.
+"""
+
+# --- Termination Strategy ---
+
+class ApprovalTerminationStrategy(TerminationStrategy):
+    """
+    A termination strategy that stops the chat when the Product Owner responds with 'READY FOR USER APPROVAL'
+    and then waits for the user's final 'APPROVED'.
+    """
+    
+    def __init__(self):
+        super().__init__()
+        self._product_owner_approved = False
+
+    async def should_agent_terminate(
+        self, agent: ChatCompletionAgent, history: List[ChatMessageContent]
+    ) -> bool:
+        """
+        Checks if the Product Owner has approved and then if the user has approved.
+        """
+        if not history:
+            return False
+
+        last_message = history[-1]
+
+        # First, check if the Product Owner has given their approval
+        if last_message.author_name == "ProductOwner" and "READY FOR USER APPROVAL" in last_message.content.upper():
+            print("\n[SYSTEM] Product Owner has indicated readiness for user approval.")
+            self._product_owner_approved = True
+            # The chat should continue to allow the user to approve
+            return False
+
+        # If the Product Owner has approved, now check for user approval
+        if self._product_owner_approved and last_message.role == AuthorRole.USER:
+            if last_message.content.upper() == "APPROVED":
+                print("\n[SYSTEM] User has approved. Terminating chat and starting code push process.")
+                return True
+            else:
+                print(f"[SYSTEM] Waiting for user to respond with 'APPROVED'. Current user response: '{last_message.content}'")
+
+        return False
+
+    async def on_termination(self, history: List[ChatMessageContent]) -> None:
+        """
+        Callback executed upon termination. Extracts code and pushes to GitHub.
+        """
+        print("[SYSTEM] Termination condition met. Executing post-chat actions.")
+        html_code = None
+        for message in reversed(history):
+            # Find the last message from the software engineer that contains the code
+            if message.author_name == "SoftwareEngineer":
+                if "```html" in message.content:
+                    # Extract code from the markdown block
+                    try:
+                        html_code = message.content.split("```html")[1].split("```")[0].strip()
+                        print("[SYSTEM] Successfully extracted HTML code.")
+                        break
+                    except IndexError:
+                        print("[SYSTEM] Error: Found a html markdown block but failed to extract code.")
+                        continue
+
+        if html_code:
+            # Save the code to a file
+            with open("index.html", "w") as f:
+                f.write(html_code)
+            print("[SYSTEM] Saved extracted code to index.html.")
+
+            # Execute the push script, assuming it already exists.
+            self._run_github_push_script()
+        else:
+            print("[SYSTEM] Could not find any HTML code from the Software Engineer to commit.")
+
+    def _run_github_push_script(self):
+        """
+        Executes an existing bash script to push the generated file to GitHub.
+        This method assumes 'push_to_github.sh' is present in the current directory.
+        """
+        script_path = "push_to_github.sh"
+        print(f"[SYSTEM] Attempting to execute GitHub push script: {script_path}")
+
+        if not os.path.exists(script_path):
+            print(f"[SYSTEM] Error: Push script '{script_path}' not found. Please ensure it is created separately in the root directory.")
+            return
+
+        try:
+            # Make the script executable and run it
+            subprocess.run(["chmod", "+x", script_path], check=True)
+            result = subprocess.run(
+                ["bash", script_path],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            print("[SYSTEM] GitHub push successful!")
+            print("STDOUT:", result.stdout)
+        except subprocess.CalledProcessError as e:
+            print(f"[SYSTEM] Error during GitHub push script execution.")
+            print(f"Return Code: {e.returncode}")
+            print(f"STDOUT: {e.stdout}")
+            print(f"STDERR: {e.stderr}")
+        except FileNotFoundError:
+            print("[SYSTEM] Error: 'bash' or 'chmod' command not found. Please ensure you are in a shell environment (like Linux, WSL, or Git Bash).")
+
+
+# --- Main Execution Logic ---
+
+async def run_multi_agent(user_input: str):
+    """
+    Initializes and runs the multi-agent system.
+    """
+    # Validate environment variables
+    required_vars = [
+        "AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", "AZURE_OPENAI_ENDPOINT",
+        "AZURE_OPENAI_API_KEY", "GITHUB_REPO_URL", "GITHUB_PAT",
+        "GIT_USER_EMAIL", "GITHUB_USERNAME"
+    ]
+    if not all(os.getenv(var) for var in required_vars):
+        print("Error: One or more required environment variables are not set.")
+        print("Please set: " + ", ".join(required_vars))
+        return
+
+    print("--- Initializing Multi-Agent System ---")
+    kernel = Kernel()
+
+    # Add the chat service to the kernel
+    kernel.add_service(
+        AzureChatCompletion(
+            deployment_name=AZURE_OPENAI_CHAT_DEPLOYMENT_NAME,
+            endpoint=AZURE_OPENAI_ENDPOINT,
+            api_key=AZURE_OPENAI_API_KEY,
+        )
+    )
+
+    # Create agents
+    business_analyst_agent = ChatCompletionAgent(
+        kernel=kernel,
+        name="BusinessAnalyst",
+        instructions=BUSINESS_ANALYST_PERSONA,
+    )
+
+    software_engineer_agent = ChatCompletionAgent(
+        kernel=kernel,
+        name="SoftwareEngineer",
+        instructions=SOFTWARE_ENGINEER_PERSONA,
+    )
+
+    product_owner_agent = ChatCompletionAgent(
+        kernel=kernel,
+        name="ProductOwner",
+        instructions=PRODUCT_OWNER_PERSONA,
+    )
+
+    # Create the agent group chat
+    chat = AgentGroupChat(
+        agents=[business_analyst_agent, software_engineer_agent, product_owner_agent],
+        termination_strategy=ApprovalTerminationStrategy(),
+    )
+
+    # Add the initial user message to the agent group chat.
+    chat.add_chat_message(
+        ChatMessageContent(
+            role=AuthorRole.USER,
+            content=user_input
+        )
+    )
+
+    print("\n--- Starting Agent Chat ---")
+    print(f"User's initial request: '{user_input}'")
+    print("-" * 30)
+
+    history = []
+    # Iterate through the responses from the AgentGroupChat.
+    async for content in chat.invoke():
+        # Using the print format as requested by the user.
+        print(f"# {content.role} - {content.author_name or '*'}: '{content.content}'")
+        history.append(content)
+
+    print("--- Agent Chat Finished ---")
+    return history
+
+
+if __name__ == "__main__":
+    # Example usage:
+    # Make sure to set your environment variables before running.
+    # Also, ensure you have cloned your target repository locally
+    # and are running this script from within that repository's directory.
+
+    # Updated user request to build a calculator app
+    user_request = "Please create a fully functional calculator web app. It should have a display, number buttons, basic arithmetic operations button and a clear button."
+
+    try:
+        asyncio.run(run_multi_agent(user_request))
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
